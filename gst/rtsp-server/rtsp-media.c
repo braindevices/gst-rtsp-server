@@ -4188,18 +4188,18 @@ gst_rtsp_media_setup_sdp (GstRTSPMedia * media, GstSDPMessage * sdp,
   g_return_val_if_fail (info != NULL, FALSE);
 
   priv = media->priv;
-
+  GST_DEBUG("try to lock state.");
   g_rec_mutex_lock (&priv->state_lock);
-
+  GST_DEBUG("lock state.");
   klass = GST_RTSP_MEDIA_GET_CLASS (media);
 
   if (!klass->setup_sdp)
     goto no_setup_sdp;
-
+  GST_DEBUG("try setup_sdp().");
   res = klass->setup_sdp (media, sdp, info);
 
   g_rec_mutex_unlock (&priv->state_lock);
-
+  GST_DEBUG("Done.");
   return res;
 
   /* ERRORS */

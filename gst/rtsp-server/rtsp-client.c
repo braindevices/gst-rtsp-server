@@ -3095,6 +3095,7 @@ keymgmt_error:
 static GstSDPMessage *
 create_sdp (GstRTSPClient * client, GstRTSPMedia * media)
 {
+  GST_DEBUG("start");
   GstRTSPClientPrivate *priv = client->priv;
   GstSDPMessage *sdp;
   GstSDPInfo info;
@@ -3129,10 +3130,11 @@ create_sdp (GstRTSPClient * client, GstRTSPMedia * media)
   info.is_ipv6 = priv->is_ipv6;
   info.server_ip = priv->server_ip;
 
+  GST_DEBUG("try get sdp from media");
   /* create an SDP for the media object */
   if (!gst_rtsp_media_setup_sdp (media, sdp, &info))
     goto no_sdp;
-
+  GST_DEBUG("successfully obtained sdp from media");
   return sdp;
 
   /* ERRORS */
@@ -3158,7 +3160,7 @@ handle_describe_request (GstRTSPClient * client, GstRTSPContext * ctx)
   GstRTSPStatusCode sig_result;
 
   klass = GST_RTSP_CLIENT_GET_CLASS (client);
-
+  GST_DEBUG("start");
   if (!ctx->uri)
     goto no_uri;
 
@@ -3193,16 +3195,18 @@ handle_describe_request (GstRTSPClient * client, GstRTSPContext * ctx)
   if (!(media = find_media (client, ctx, path, NULL)))
     goto no_media;
 
+  GST_DEBUG("try to lock media");
+  //TODO: timeout lock, if failed return with error, instead of deadlock
   gst_rtsp_media_lock (media);
 
   if (!(gst_rtsp_media_get_transport_mode (media) &
           GST_RTSP_TRANSPORT_MODE_PLAY))
     goto unsupported_mode;
-
+  GST_DEBUG("try to get sdp from media");
   /* create an SDP for the media object on this client */
   if (!(sdp = klass->create_sdp (client, media)))
     goto no_sdp;
-
+  GST_DEBUG("successfully obtained sdp from media.");
   /* we suspend after the describe */
   gst_rtsp_media_suspend (media);
 
@@ -3225,13 +3229,13 @@ handle_describe_request (GstRTSPClient * client, GstRTSPContext * ctx)
   gst_sdp_message_free (sdp);
 
   send_message (client, ctx, ctx->response, FALSE);
-
+  GST_DEBUG("emit describe-request signal.");
   g_signal_emit (client, gst_rtsp_client_signals[SIGNAL_DESCRIBE_REQUEST],
       0, ctx);
 
   gst_rtsp_media_unlock (media);
   g_object_unref (media);
-
+  GST_DEBUG("Done.");
   return TRUE;
 
   /* ERRORS */
