@@ -4179,10 +4179,10 @@ gboolean
 gst_rtsp_media_setup_sdp (GstRTSPMedia * media, GstSDPMessage * sdp,
     GstSDPInfo * info)
 {
+  GST_DEBUG("start");
   GstRTSPMediaPrivate *priv;
   GstRTSPMediaClass *klass;
   gboolean res;
-
   g_return_val_if_fail (GST_IS_RTSP_MEDIA (media), FALSE);
   g_return_val_if_fail (sdp != NULL, FALSE);
   g_return_val_if_fail (info != NULL, FALSE);
