@@ -365,6 +365,12 @@ GstRTSPStream *       gst_rtsp_media_create_stream    (GstRTSPMedia *media,
 /* dealing with the media */
 
 GST_RTSP_SERVER_API
+void                  gst_rtsp_media_lock             (GstRTSPMedia *media);
+
+GST_RTSP_SERVER_API
+void                  gst_rtsp_media_unlock           (GstRTSPMedia *media);
+
+GST_RTSP_SERVER_API
 GstClock *            gst_rtsp_media_get_clock        (GstRTSPMedia *media);
 
 GST_RTSP_SERVER_API
@@ -420,6 +426,9 @@ gboolean              gst_rtsp_media_complete_pipeline (GstRTSPMedia * media, GP
 
 GST_RTSP_SERVER_API
 gboolean              gst_rtsp_media_is_receive_only (GstRTSPMedia * media);
+
+GST_RTSP_SERVER_API
+gboolean              gst_rtsp_media_has_completed_sender (GstRTSPMedia * media);
 
 GST_RTSP_SERVER_API
 void                  gst_rtsp_media_set_rate_control (GstRTSPMedia * media, gboolean enabled);

@@ -59,6 +59,51 @@ test_response_200 (GstRTSPClient * client, GstRTSPMessage * response,
 }
 
 static gboolean
+test_response_play_200 (GstRTSPClient * client, GstRTSPMessage * response,
+    gboolean close, gpointer user_data)
+{
+  GstRTSPStatusCode code;
+  const gchar *reason;
+  GstRTSPVersion version;
+  gchar *str;
+  gchar **session_hdr_params;
+  gchar *pattern;
+
+  fail_unless_equals_int (gst_rtsp_message_get_type (response),
+      GST_RTSP_MESSAGE_RESPONSE);
+
+  fail_unless (gst_rtsp_message_parse_response (response, &code, &reason,
+          &version)
+      == GST_RTSP_OK);
+  fail_unless_equals_int (code, GST_RTSP_STS_OK);
+  fail_unless_equals_string (reason, "OK");
+  fail_unless_equals_int (version, GST_RTSP_VERSION_1_0);
+
+  /* Verify mandatory headers according to RFC 2326 */
+  /* verify mandatory CSeq header */
+  fail_unless (gst_rtsp_message_get_header (response, GST_RTSP_HDR_CSEQ, &str,
+          0) == GST_RTSP_OK);
+  fail_unless (atoi (str) == cseq++);
+
+  /* verify mandatory Session header */
+  fail_unless (gst_rtsp_message_get_header (response, GST_RTSP_HDR_SESSION,
+          &str, 0) == GST_RTSP_OK);
+  session_hdr_params = g_strsplit (str, ";", -1);
+  fail_unless (session_hdr_params[0] != NULL);
+  g_strfreev (session_hdr_params);
+
+  /* verify mandatory RTP-Info header */
+  fail_unless (gst_rtsp_message_get_header (response, GST_RTSP_HDR_RTP_INFO,
+          &str, 0) == GST_RTSP_OK);
+  pattern = g_strdup_printf ("^url=rtsp://.+;seq=[0-9]+;rtptime=[0-9]+");
+  fail_unless (g_regex_match_simple (pattern, str, 0, 0),
+      "GST_RTSP_HDR_RTP_INFO '%s' doesn't match pattern '%s'", str, pattern);
+  g_free (pattern);
+
+  return TRUE;
+}
+
+static gboolean
 test_response_400 (GstRTSPClient * client, GstRTSPMessage * response,
     gboolean close, gpointer user_data)
 {
@@ -1802,10 +1847,12 @@ attach_rate_tweaking_probe (void)
 
   gst_pad_add_probe (srcpad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
       rate_tweaking_probe, NULL, NULL);
+  gst_object_unref (srcpad);
 }
 
 static void
-do_test_scale_and_speed (const gchar * scale, const gchar * speed)
+do_test_scale_and_speed (const gchar * scale, const gchar * speed,
+    GstRTSPStatusCode expected_response_code)
 {
   GstRTSPClient *client;
   GstRTSPMessage request = { 0, };
@@ -1833,7 +1880,7 @@ do_test_scale_and_speed (const gchar * scale, const gchar * speed)
   gst_rtsp_message_add_header (&request, GST_RTSP_HDR_TRANSPORT,
       "RTP/AVP;multicast");
   expected_transport = "RTP/AVP;multicast;destination=233.252.0.1;"
-      "ttl=1;port=5000-5001;mode=\"PLAY\"";
+      "ttl=1;port=.*;mode=\"PLAY\"";
   gst_rtsp_client_set_send_func (client, test_setup_response_200, NULL, NULL);
   fail_unless (gst_rtsp_client_handle_message (client,
           &request) == GST_RTSP_OK);
@@ -1855,7 +1902,12 @@ do_test_scale_and_speed (const gchar * scale, const gchar * speed)
   if (speed != NULL)
     gst_rtsp_message_add_header (&request, GST_RTSP_HDR_SPEED, speed);
 
-  gst_rtsp_client_set_send_func (client, test_response_scale_speed, NULL, NULL);
+  if (expected_response_code == GST_RTSP_STS_BAD_REQUEST)
+    gst_rtsp_client_set_send_func (client, test_response_400, NULL, NULL);
+  else
+    gst_rtsp_client_set_send_func (client, test_response_scale_speed, NULL,
+        NULL);
+
   fail_unless (gst_rtsp_client_handle_message (client,
           &request) == GST_RTSP_OK);
   gst_rtsp_message_unset (&request);
@@ -1873,28 +1925,28 @@ GST_START_TEST (test_scale_and_speed)
   /* no scale/speed requested, no scale/speed should be received */
   expected_scale_header = NULL;
   expected_speed_header = NULL;
-  do_test_scale_and_speed (NULL, NULL);
+  do_test_scale_and_speed (NULL, NULL, GST_RTSP_STS_OK);
 
   /* scale requested, scale should be received */
   fake_applied_rate_value = 2;
   fake_rate_value = 1;
   expected_scale_header = "2.000";
   expected_speed_header = NULL;
-  do_test_scale_and_speed ("2.000", NULL);
+  do_test_scale_and_speed ("2.000", NULL, GST_RTSP_STS_OK);
 
   /* speed requested, speed should be received */
   fake_applied_rate_value = 0;
   fake_rate_value = 0;
   expected_scale_header = NULL;
   expected_speed_header = "2.000";
-  do_test_scale_and_speed (NULL, "2.000");
+  do_test_scale_and_speed (NULL, "2.000", GST_RTSP_STS_OK);
 
   /* both requested, both should be received */
   fake_applied_rate_value = 2;
   fake_rate_value = 2;
   expected_scale_header = "2.000";
   expected_speed_header = "2.000";
-  do_test_scale_and_speed ("2", "2");
+  do_test_scale_and_speed ("2", "2", GST_RTSP_STS_OK);
 
   /* scale requested but media doesn't handle scaling so both should be
    * received, with scale set to 1.000 and speed set to (requested scale
@@ -1903,7 +1955,7 @@ GST_START_TEST (test_scale_and_speed)
   fake_rate_value = 5;
   expected_scale_header = "1.000";
   expected_speed_header = "5.000";
-  do_test_scale_and_speed ("5", NULL);
+  do_test_scale_and_speed ("5", NULL, GST_RTSP_STS_OK);
 
   /* both requested but media only handles scaling so both should be received,
    * with scale set to (requested scale * requested speed) and speed set to 1.00
@@ -1912,7 +1964,71 @@ GST_START_TEST (test_scale_and_speed)
   fake_applied_rate_value = 4.000;
   expected_scale_header = "4.000";
   expected_speed_header = "1.000";
-  do_test_scale_and_speed ("2", "2");
+  do_test_scale_and_speed ("2", "2", GST_RTSP_STS_OK);
+
+  /* test invalid values */
+  fake_applied_rate_value = 0;
+  fake_rate_value = 0;
+  expected_scale_header = NULL;
+  expected_speed_header = NULL;
+
+  /* scale or speed not decimal values */
+  do_test_scale_and_speed ("x", NULL, GST_RTSP_STS_BAD_REQUEST);
+  do_test_scale_and_speed (NULL, "y", GST_RTSP_STS_BAD_REQUEST);
+
+  /* scale or speed illegal decimal values */
+  do_test_scale_and_speed ("0", NULL, GST_RTSP_STS_BAD_REQUEST);
+  do_test_scale_and_speed (NULL, "0", GST_RTSP_STS_BAD_REQUEST);
+  do_test_scale_and_speed (NULL, "-2", GST_RTSP_STS_BAD_REQUEST);
+}
+
+GST_END_TEST
+GST_START_TEST (test_client_play)
+{
+  GstRTSPClient *client;
+  GstRTSPMessage request = { 0, };
+  gchar *str;
+  GstRTSPContext ctx = { NULL };
+
+  client = setup_multicast_client (1);
+
+  ctx.client = client;
+  ctx.auth = gst_rtsp_auth_new ();
+  ctx.token =
+      gst_rtsp_token_new (GST_RTSP_TOKEN_MEDIA_FACTORY_ROLE, G_TYPE_STRING,
+      "user", NULL);
+  gst_rtsp_context_push_current (&ctx);
+
+  fail_unless (gst_rtsp_message_init_request (&request, GST_RTSP_SETUP,
+          "rtsp://localhost/test/stream=0") == GST_RTSP_OK);
+  str = g_strdup_printf ("%d", cseq);
+  gst_rtsp_message_take_header (&request, GST_RTSP_HDR_CSEQ, str);
+  gst_rtsp_message_add_header (&request, GST_RTSP_HDR_TRANSPORT,
+      "RTP/AVP;multicast");
+  /* destination is from adress pool */
+  expected_transport = "RTP/AVP;multicast;destination=233.252.0.1;"
+      "ttl=1;port=.*;mode=\"PLAY\"";
+  gst_rtsp_client_set_send_func (client, test_setup_response_200, NULL, NULL);
+  fail_unless (gst_rtsp_client_handle_message (client,
+          &request) == GST_RTSP_OK);
+  gst_rtsp_message_unset (&request);
+  expected_transport = NULL;
+
+  fail_unless (gst_rtsp_message_init_request (&request, GST_RTSP_PLAY,
+          "rtsp://localhost/test") == GST_RTSP_OK);
+  str = g_strdup_printf ("%d", cseq);
+  gst_rtsp_message_take_header (&request, GST_RTSP_HDR_CSEQ, str);
+  gst_rtsp_message_add_header (&request, GST_RTSP_HDR_SESSION, session_id);
+  gst_rtsp_client_set_send_func (client, test_response_play_200, NULL, NULL);
+  fail_unless (gst_rtsp_client_handle_message (client,
+          &request) == GST_RTSP_OK);
+  gst_rtsp_message_unset (&request);
+
+  send_teardown (client);
+  teardown_client (client);
+  g_object_unref (ctx.auth);
+  gst_rtsp_token_unref (ctx.token);
+  gst_rtsp_context_pop_current (&ctx);
 }
 
 GST_END_TEST static Suite *
@@ -1968,6 +2084,7 @@ rtspclient_suite (void)
   tcase_add_test (tc, test_client_multicast_max_ttl_second_client);
   tcase_add_test (tc, test_client_multicast_invalid_ttl);
   tcase_add_test (tc, test_scale_and_speed);
+  tcase_add_test (tc, test_client_play);
 
   return s;
 }

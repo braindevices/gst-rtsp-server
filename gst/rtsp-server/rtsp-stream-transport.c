@@ -28,7 +28,7 @@
  * to handle the RTP and RTCP packets from the stream, for example when they
  * need to be sent over TCP.
  *
- * With  gst_rtsp_stream_transport_set_active() the transports are added and
+ * With gst_rtsp_stream_transport_set_active() the transports are added and
  * removed from the stream.
  *
  * A #GstRTSPStream will call gst_rtsp_stream_transport_keep_alive() when RTCP
@@ -48,6 +48,7 @@
 #include <stdlib.h>
 
 #include "rtsp-stream-transport.h"
+#include "rtsp-server-internal.h"
 
 struct _GstRTSPStreamTransportPrivate
 {
@@ -63,21 +64,44 @@ struct _GstRTSPStreamTransportPrivate
   gpointer list_user_data;
   GDestroyNotify list_notify;
 
+  GstRTSPBackPressureFunc back_pressure_func;
+  gpointer back_pressure_func_data;
+  GDestroyNotify back_pressure_func_notify;
+
   GstRTSPKeepAliveFunc keep_alive;
   gpointer ka_user_data;
   GDestroyNotify ka_notify;
-  gboolean active;
   gboolean timed_out;
 
   GstRTSPMessageSentFunc message_sent;
   gpointer ms_user_data;
   GDestroyNotify ms_notify;
 
+  GstRTSPMessageSentFuncFull message_sent_full;
+  gpointer msf_user_data;
+  GDestroyNotify msf_notify;
+
   GstRTSPTransport *transport;
   GstRTSPUrl *url;
 
   GObject *rtpsource;
+
+  /* TCP backlog */
+  GstClockTime first_rtp_timestamp;
+  GstQueueArray *items;
+  GRecMutex backlog_lock;
 };
+
+#define MAX_BACKLOG_DURATION (10 * GST_SECOND)
+#define MAX_BACKLOG_SIZE 100
+
+typedef struct
+{
+  GstBuffer *buffer;
+  GstBufferList *buffer_list;
+  gboolean is_rtp;
+} BackLogItem;
+
 
 enum
 {
@@ -107,9 +131,21 @@ gst_rtsp_stream_transport_class_init (GstRTSPStreamTransportClass * klass)
 }
 
 static void
+clear_backlog_item (BackLogItem * item)
+{
+  gst_clear_buffer (&item->buffer);
+  gst_clear_buffer_list (&item->buffer_list);
+}
+
+static void
 gst_rtsp_stream_transport_init (GstRTSPStreamTransport * trans)
 {
   trans->priv = gst_rtsp_stream_transport_get_instance_private (trans);
+  trans->priv->items = gst_queue_array_new_for_struct (sizeof (BackLogItem), 0);
+  trans->priv->first_rtp_timestamp = GST_CLOCK_TIME_NONE;
+  gst_queue_array_set_clear_func (trans->priv->items,
+      (GDestroyNotify) clear_backlog_item);
+  g_rec_mutex_init (&trans->priv->backlog_lock);
 }
 
 static void
@@ -134,6 +170,10 @@ gst_rtsp_stream_transport_finalize (GObject * obj)
 
   if (priv->url)
     gst_rtsp_url_free (priv->url);
+
+  gst_queue_array_free (priv->items);
+
+  g_rec_mutex_clear (&priv->backlog_lock);
 
   G_OBJECT_CLASS (gst_rtsp_stream_transport_parent_class)->finalize (obj);
 }
@@ -244,6 +284,45 @@ gst_rtsp_stream_transport_set_list_callbacks (GstRTSPStreamTransport * trans,
   priv->list_notify = notify;
 }
 
+void
+gst_rtsp_stream_transport_set_back_pressure_callback (GstRTSPStreamTransport *
+    trans, GstRTSPBackPressureFunc back_pressure_func, gpointer user_data,
+    GDestroyNotify notify)
+{
+  GstRTSPStreamTransportPrivate *priv;
+
+  g_return_if_fail (GST_IS_RTSP_STREAM_TRANSPORT (trans));
+
+  priv = trans->priv;
+
+  priv->back_pressure_func = back_pressure_func;
+  if (priv->back_pressure_func_notify)
+    priv->back_pressure_func_notify (priv->back_pressure_func_data);
+  priv->back_pressure_func_data = user_data;
+  priv->back_pressure_func_notify = notify;
+}
+
+gboolean
+gst_rtsp_stream_transport_check_back_pressure (GstRTSPStreamTransport * trans,
+    gboolean is_rtp)
+{
+  GstRTSPStreamTransportPrivate *priv;
+  gboolean ret = FALSE;
+  guint8 channel;
+
+  priv = trans->priv;
+
+  if (is_rtp)
+    channel = priv->transport->interleaved.min;
+  else
+    channel = priv->transport->interleaved.max;
+
+  if (priv->back_pressure_func)
+    ret = priv->back_pressure_func (channel, priv->back_pressure_func_data);
+
+  return ret;
+}
+
 /**
  * gst_rtsp_stream_transport_set_keepalive:
  * @trans: a #GstRTSPStreamTransport
@@ -298,6 +377,34 @@ gst_rtsp_stream_transport_set_message_sent (GstRTSPStreamTransport * trans,
   priv->ms_notify = notify;
 }
 
+/**
+ * gst_rtsp_stream_transport_set_message_sent_full:
+ * @trans: a #GstRTSPStreamTransport
+ * @message_sent: (scope notified): a callback called when a message has been sent
+ * @user_data: (closure): user data passed to callback
+ * @notify: (allow-none): called with the user_data when no longer needed
+ *
+ * Install a callback that will be called when a message has been sent on @trans.
+ *
+ * Since: 1.18
+ */
+void
+gst_rtsp_stream_transport_set_message_sent_full (GstRTSPStreamTransport * trans,
+    GstRTSPMessageSentFuncFull message_sent, gpointer user_data,
+    GDestroyNotify notify)
+{
+  GstRTSPStreamTransportPrivate *priv;
+
+  g_return_if_fail (GST_IS_RTSP_STREAM_TRANSPORT (trans));
+
+  priv = trans->priv;
+
+  priv->message_sent_full = message_sent;
+  if (priv->msf_notify)
+    priv->msf_notify (priv->msf_user_data);
+  priv->msf_user_data = user_data;
+  priv->msf_notify = notify;
+}
 
 /**
  * gst_rtsp_stream_transport_set_transport:
@@ -460,16 +567,10 @@ gst_rtsp_stream_transport_set_active (GstRTSPStreamTransport * trans,
 
   priv = trans->priv;
 
-  if (priv->active == active)
-    return FALSE;
-
   if (active)
     res = gst_rtsp_stream_add_transport (priv->stream, trans);
   else
     res = gst_rtsp_stream_remove_transport (priv->stream, trans);
-
-  if (res)
-    priv->active = active;
 
   return res;
 }
@@ -681,7 +782,7 @@ gst_rtsp_stream_transport_keep_alive (GstRTSPStreamTransport * trans)
  * gst_rtsp_stream_transport_message_sent:
  * @trans: a #GstRTSPStreamTransport
  *
- * Signal the installed message_sent callback for @trans.
+ * Signal the installed message_sent / message_sent_full callback for @trans.
  *
  * Since: 1.16
  */
@@ -692,6 +793,8 @@ gst_rtsp_stream_transport_message_sent (GstRTSPStreamTransport * trans)
 
   priv = trans->priv;
 
+  if (priv->message_sent_full)
+    priv->message_sent_full (trans, priv->msf_user_data);
   if (priv->message_sent)
     priv->message_sent (priv->ms_user_data);
 }
@@ -728,4 +831,154 @@ gst_rtsp_stream_transport_recv_data (GstRTSPStreamTransport * trans,
     res = GST_FLOW_NOT_LINKED;
   }
   return res;
+}
+
+static GstClockTime
+get_backlog_item_timestamp (BackLogItem * item)
+{
+  GstClockTime ret = GST_CLOCK_TIME_NONE;
+
+  if (item->buffer) {
+    ret = GST_BUFFER_DTS_OR_PTS (item->buffer);
+  } else if (item->buffer_list) {
+    g_assert (gst_buffer_list_length (item->buffer_list) > 0);
+    ret = GST_BUFFER_DTS_OR_PTS (gst_buffer_list_get (item->buffer_list, 0));
+  }
+
+  return ret;
+}
+
+static GstClockTime
+get_first_backlog_timestamp (GstRTSPStreamTransport * trans)
+{
+  GstRTSPStreamTransportPrivate *priv = trans->priv;
+  GstClockTime ret = GST_CLOCK_TIME_NONE;
+  guint i, l;
+
+  l = gst_queue_array_get_length (priv->items);
+
+  for (i = 0; i < l; i++) {
+    BackLogItem *item = (BackLogItem *)
+        gst_queue_array_peek_nth_struct (priv->items, i);
+
+    if (item->is_rtp) {
+      ret = get_backlog_item_timestamp (item);
+      break;
+    }
+  }
+
+  return ret;
+}
+
+/* Not MT-safe, caller should ensure consistent locking (see
+ * gst_rtsp_stream_transport_lock_backlog()). Ownership
+ * of @buffer and @buffer_list is transfered to the transport */
+gboolean
+gst_rtsp_stream_transport_backlog_push (GstRTSPStreamTransport * trans,
+    GstBuffer * buffer, GstBufferList * buffer_list, gboolean is_rtp)
+{
+  gboolean ret = TRUE;
+  BackLogItem item = { 0, };
+  GstClockTime item_timestamp;
+  GstRTSPStreamTransportPrivate *priv;
+
+  priv = trans->priv;
+
+  if (buffer)
+    item.buffer = buffer;
+  if (buffer_list)
+    item.buffer_list = buffer_list;
+  item.is_rtp = is_rtp;
+
+  gst_queue_array_push_tail_struct (priv->items, &item);
+
+  item_timestamp = get_backlog_item_timestamp (&item);
+
+  if (is_rtp && priv->first_rtp_timestamp != GST_CLOCK_TIME_NONE) {
+    GstClockTimeDiff queue_duration;
+
+    g_assert (GST_CLOCK_TIME_IS_VALID (item_timestamp));
+
+    queue_duration = GST_CLOCK_DIFF (priv->first_rtp_timestamp, item_timestamp);
+
+    g_assert (queue_duration >= 0);
+
+    if (queue_duration > MAX_BACKLOG_DURATION &&
+        gst_queue_array_get_length (priv->items) > MAX_BACKLOG_SIZE) {
+      ret = FALSE;
+    }
+  } else if (is_rtp) {
+    priv->first_rtp_timestamp = item_timestamp;
+  }
+
+  return ret;
+}
+
+/* Not MT-safe, caller should ensure consistent locking (see
+ * gst_rtsp_stream_transport_lock_backlog()). Ownership
+ * of @buffer and @buffer_list is transfered back to the caller,
+ * if either of those is NULL the underlying object is unreffed */
+gboolean
+gst_rtsp_stream_transport_backlog_pop (GstRTSPStreamTransport * trans,
+    GstBuffer ** buffer, GstBufferList ** buffer_list, gboolean * is_rtp)
+{
+  BackLogItem *item;
+  GstRTSPStreamTransportPrivate *priv;
+
+  g_return_val_if_fail (!gst_rtsp_stream_transport_backlog_is_empty (trans),
+      FALSE);
+
+  priv = trans->priv;
+
+  item = (BackLogItem *) gst_queue_array_pop_head_struct (priv->items);
+
+  priv->first_rtp_timestamp = get_first_backlog_timestamp (trans);
+
+  if (buffer)
+    *buffer = item->buffer;
+  else if (item->buffer)
+    gst_buffer_unref (item->buffer);
+
+  if (buffer_list)
+    *buffer_list = item->buffer_list;
+  else if (item->buffer_list)
+    gst_buffer_list_unref (item->buffer_list);
+
+  if (is_rtp)
+    *is_rtp = item->is_rtp;
+
+  return TRUE;
+}
+
+/* Not MT-safe, caller should ensure consistent locking.
+ * See gst_rtsp_stream_transport_lock_backlog() */
+gboolean
+gst_rtsp_stream_transport_backlog_is_empty (GstRTSPStreamTransport * trans)
+{
+  return gst_queue_array_is_empty (trans->priv->items);
+}
+
+/* Not MT-safe, caller should ensure consistent locking.
+ * See gst_rtsp_stream_transport_lock_backlog() */
+void
+gst_rtsp_stream_transport_clear_backlog (GstRTSPStreamTransport * trans)
+{
+  while (!gst_rtsp_stream_transport_backlog_is_empty (trans)) {
+    gst_rtsp_stream_transport_backlog_pop (trans, NULL, NULL, NULL);
+  }
+}
+
+/* Internal API, protects access to the TCP backlog. Safe to
+ * call recursively */
+void
+gst_rtsp_stream_transport_lock_backlog (GstRTSPStreamTransport * trans)
+{
+  g_rec_mutex_lock (&trans->priv->backlog_lock);
+}
+
+/* See gst_rtsp_stream_transport_lock_backlog() */
+void
+gst_rtsp_stream_transport_unlock_backlog (GstRTSPStreamTransport * trans)
+{
+  g_rec_mutex_unlock (&trans->priv->backlog_lock);
 }

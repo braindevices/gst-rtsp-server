@@ -172,7 +172,7 @@ gst_rtsp_auth_class_init (GstRTSPAuthClass * klass)
       G_TYPE_FROM_CLASS (gobject_class),
       G_SIGNAL_RUN_LAST,
       G_STRUCT_OFFSET (GstRTSPAuthClass, accept_certificate),
-      g_signal_accumulator_true_handled, NULL, g_cclosure_marshal_generic,
+      g_signal_accumulator_true_handled, NULL, NULL,
       G_TYPE_BOOLEAN, 3, G_TYPE_TLS_CONNECTION, G_TYPE_TLS_CERTIFICATE,
       G_TYPE_TLS_CERTIFICATE_FLAGS);
 }
@@ -214,6 +214,8 @@ gst_rtsp_auth_finalize (GObject * obj)
   g_hash_table_unref (priv->basic);
   g_hash_table_unref (priv->digest);
   g_hash_table_unref (priv->nonces);
+  if (priv->default_token)
+    gst_rtsp_token_unref (priv->default_token);
   g_mutex_clear (&priv->lock);
   g_free (priv->realm);
 
@@ -869,7 +871,7 @@ default_authenticate (GstRTSPAuth * auth, GstRTSPContext * ctx)
 
       GST_DEBUG_OBJECT (auth, "check Basic auth");
       g_mutex_lock (&priv->lock);
-      if ((token =
+      if ((*credential)->authorization && (token =
               g_hash_table_lookup (priv->basic,
                   (*credential)->authorization))) {
         GST_DEBUG_OBJECT (auth, "setting token %p", token);

@@ -53,6 +53,7 @@
 #include "rtsp-client.h"
 #include "rtsp-sdp.h"
 #include "rtsp-params.h"
+#include "rtsp-server-internal.h"
 
 typedef enum
 {
@@ -83,7 +84,6 @@ struct _GstRTSPClientPrivate
   GstRTSPClientSendMessagesFunc send_messages_func;
   gpointer send_messages_data;
   GDestroyNotify send_messages_notify;
-  guint close_seq;
   GArray *data_seqs;
 
   GstRTSPSessionPool *session_pool;
@@ -102,10 +102,12 @@ struct _GstRTSPClientPrivate
   guint sessions_cookie;
 
   gboolean drop_backlog;
+  gint post_session_timeout;
 
   guint content_length_limit;
 
-  guint rtsp_ctrl_timeout_id;
+  gboolean had_session;
+  GSource *rtsp_ctrl_timeout;
   guint rtsp_ctrl_timeout_cnt;
 
   /* The version currently being used */
@@ -129,6 +131,7 @@ static GHashTable *tunnels;     /* protected by tunnels_lock */
 #define DEFAULT_SESSION_POOL            NULL
 #define DEFAULT_MOUNT_POINTS            NULL
 #define DEFAULT_DROP_BACKLOG            TRUE
+#define DEFAULT_POST_SESSION_TIMEOUT    -1
 
 #define RTSP_CTRL_CB_INTERVAL           1
 #define RTSP_CTRL_TIMEOUT_VALUE         60
@@ -139,6 +142,7 @@ enum
   PROP_SESSION_POOL,
   PROP_MOUNT_POINTS,
   PROP_DROP_BACKLOG,
+  PROP_POST_SESSION_TIMEOUT,
   PROP_LAST
 };
 
@@ -254,15 +258,35 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
           "Drop data when the backlog queue is full",
           DEFAULT_DROP_BACKLOG, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  /**
+   * GstRTSPClient::post-session-timeout:
+   *
+   * An extra tcp timeout ( > 0) after session timeout, in seconds.
+   * The tcp connection will be kept alive until this timeout happens to give
+   * the client a possibility to reuse the connection.
+   * 0 means that the connection will be closed immediately after the session
+   * timeout.
+   *
+   * Default value is -1 seconds, meaning that we let the system close
+   * the connection.
+   *
+   * Since: 1.18
+   */
+  g_object_class_install_property (gobject_class, PROP_POST_SESSION_TIMEOUT,
+      g_param_spec_int ("post-session-timeout", "Post Session Timeout",
+          "An extra TCP connection timeout after session timeout", G_MININT,
+          G_MAXINT, DEFAULT_POST_SESSION_TIMEOUT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   gst_rtsp_client_signals[SIGNAL_CLOSED] =
       g_signal_new ("closed", G_TYPE_FROM_CLASS (klass), G_SIGNAL_RUN_LAST,
-      G_STRUCT_OFFSET (GstRTSPClientClass, closed), NULL, NULL,
-      g_cclosure_marshal_generic, G_TYPE_NONE, 0, G_TYPE_NONE);
+      G_STRUCT_OFFSET (GstRTSPClientClass, closed), NULL, NULL, NULL,
+      G_TYPE_NONE, 0, G_TYPE_NONE);
 
   gst_rtsp_client_signals[SIGNAL_NEW_SESSION] =
       g_signal_new ("new-session", G_TYPE_FROM_CLASS (klass), G_SIGNAL_RUN_LAST,
-      G_STRUCT_OFFSET (GstRTSPClientClass, new_session), NULL, NULL,
-      g_cclosure_marshal_generic, G_TYPE_NONE, 1, GST_TYPE_RTSP_SESSION);
+      G_STRUCT_OFFSET (GstRTSPClientClass, new_session), NULL, NULL, NULL,
+      G_TYPE_NONE, 1, GST_TYPE_RTSP_SESSION);
 
   /**
    * GstRTSPClient::pre-options-request:
@@ -277,9 +301,8 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
   gst_rtsp_client_signals[SIGNAL_PRE_OPTIONS_REQUEST] =
       g_signal_new ("pre-options-request", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstRTSPClientClass,
-          pre_options_request), pre_signal_accumulator, NULL,
-      g_cclosure_marshal_generic, GST_TYPE_RTSP_STATUS_CODE, 1,
-      GST_TYPE_RTSP_CONTEXT);
+          pre_options_request), pre_signal_accumulator, NULL, NULL,
+      GST_TYPE_RTSP_STATUS_CODE, 1, GST_TYPE_RTSP_CONTEXT);
 
   /**
    * GstRTSPClient::options-request:
@@ -289,8 +312,7 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
   gst_rtsp_client_signals[SIGNAL_OPTIONS_REQUEST] =
       g_signal_new ("options-request", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstRTSPClientClass, options_request),
-      NULL, NULL, g_cclosure_marshal_generic, G_TYPE_NONE, 1,
-      GST_TYPE_RTSP_CONTEXT);
+      NULL, NULL, NULL, G_TYPE_NONE, 1, GST_TYPE_RTSP_CONTEXT);
 
   /**
    * GstRTSPClient::pre-describe-request:
@@ -305,9 +327,8 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
   gst_rtsp_client_signals[SIGNAL_PRE_DESCRIBE_REQUEST] =
       g_signal_new ("pre-describe-request", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstRTSPClientClass,
-          pre_describe_request), pre_signal_accumulator, NULL,
-      g_cclosure_marshal_generic, GST_TYPE_RTSP_STATUS_CODE, 1,
-      GST_TYPE_RTSP_CONTEXT);
+          pre_describe_request), pre_signal_accumulator, NULL, NULL,
+      GST_TYPE_RTSP_STATUS_CODE, 1, GST_TYPE_RTSP_CONTEXT);
 
   /**
    * GstRTSPClient::describe-request:
@@ -317,8 +338,7 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
   gst_rtsp_client_signals[SIGNAL_DESCRIBE_REQUEST] =
       g_signal_new ("describe-request", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstRTSPClientClass, describe_request),
-      NULL, NULL, g_cclosure_marshal_generic, G_TYPE_NONE, 1,
-      GST_TYPE_RTSP_CONTEXT);
+      NULL, NULL, NULL, G_TYPE_NONE, 1, GST_TYPE_RTSP_CONTEXT);
 
   /**
    * GstRTSPClient::pre-setup-request:
@@ -333,9 +353,8 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
   gst_rtsp_client_signals[SIGNAL_PRE_SETUP_REQUEST] =
       g_signal_new ("pre-setup-request", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstRTSPClientClass,
-          pre_setup_request), pre_signal_accumulator, NULL,
-      g_cclosure_marshal_generic, GST_TYPE_RTSP_STATUS_CODE, 1,
-      GST_TYPE_RTSP_CONTEXT);
+          pre_setup_request), pre_signal_accumulator, NULL, NULL,
+      GST_TYPE_RTSP_STATUS_CODE, 1, GST_TYPE_RTSP_CONTEXT);
 
   /**
    * GstRTSPClient::setup-request:
@@ -345,8 +364,7 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
   gst_rtsp_client_signals[SIGNAL_SETUP_REQUEST] =
       g_signal_new ("setup-request", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstRTSPClientClass, setup_request),
-      NULL, NULL, g_cclosure_marshal_generic, G_TYPE_NONE, 1,
-      GST_TYPE_RTSP_CONTEXT);
+      NULL, NULL, NULL, G_TYPE_NONE, 1, GST_TYPE_RTSP_CONTEXT);
 
   /**
    * GstRTSPClient::pre-play-request:
@@ -362,8 +380,7 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
       g_signal_new ("pre-play-request", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstRTSPClientClass,
           pre_play_request), pre_signal_accumulator, NULL,
-      g_cclosure_marshal_generic, GST_TYPE_RTSP_STATUS_CODE, 1,
-      GST_TYPE_RTSP_CONTEXT);
+      NULL, GST_TYPE_RTSP_STATUS_CODE, 1, GST_TYPE_RTSP_CONTEXT);
 
   /**
    * GstRTSPClient::play-request:
@@ -373,8 +390,7 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
   gst_rtsp_client_signals[SIGNAL_PLAY_REQUEST] =
       g_signal_new ("play-request", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstRTSPClientClass, play_request),
-      NULL, NULL, g_cclosure_marshal_generic, G_TYPE_NONE, 1,
-      GST_TYPE_RTSP_CONTEXT);
+      NULL, NULL, NULL, G_TYPE_NONE, 1, GST_TYPE_RTSP_CONTEXT);
 
   /**
    * GstRTSPClient::pre-pause-request:
@@ -389,9 +405,8 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
   gst_rtsp_client_signals[SIGNAL_PRE_PAUSE_REQUEST] =
       g_signal_new ("pre-pause-request", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstRTSPClientClass,
-          pre_pause_request), pre_signal_accumulator, NULL,
-      g_cclosure_marshal_generic, GST_TYPE_RTSP_STATUS_CODE, 1,
-      GST_TYPE_RTSP_CONTEXT);
+          pre_pause_request), pre_signal_accumulator, NULL, NULL,
+      GST_TYPE_RTSP_STATUS_CODE, 1, GST_TYPE_RTSP_CONTEXT);
 
   /**
    * GstRTSPClient::pause-request:
@@ -401,8 +416,7 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
   gst_rtsp_client_signals[SIGNAL_PAUSE_REQUEST] =
       g_signal_new ("pause-request", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstRTSPClientClass, pause_request),
-      NULL, NULL, g_cclosure_marshal_generic, G_TYPE_NONE, 1,
-      GST_TYPE_RTSP_CONTEXT);
+      NULL, NULL, NULL, G_TYPE_NONE, 1, GST_TYPE_RTSP_CONTEXT);
 
   /**
    * GstRTSPClient::pre-teardown-request:
@@ -417,9 +431,8 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
   gst_rtsp_client_signals[SIGNAL_PRE_TEARDOWN_REQUEST] =
       g_signal_new ("pre-teardown-request", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstRTSPClientClass,
-          pre_teardown_request), pre_signal_accumulator, NULL,
-      g_cclosure_marshal_generic, GST_TYPE_RTSP_STATUS_CODE, 1,
-      GST_TYPE_RTSP_CONTEXT);
+          pre_teardown_request), pre_signal_accumulator, NULL, NULL,
+      GST_TYPE_RTSP_STATUS_CODE, 1, GST_TYPE_RTSP_CONTEXT);
 
   /**
    * GstRTSPClient::teardown-request:
@@ -429,8 +442,7 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
   gst_rtsp_client_signals[SIGNAL_TEARDOWN_REQUEST] =
       g_signal_new ("teardown-request", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstRTSPClientClass, teardown_request),
-      NULL, NULL, g_cclosure_marshal_generic, G_TYPE_NONE, 1,
-      GST_TYPE_RTSP_CONTEXT);
+      NULL, NULL, NULL, G_TYPE_NONE, 1, GST_TYPE_RTSP_CONTEXT);
 
   /**
    * GstRTSPClient::pre-set-parameter-request:
@@ -445,8 +457,7 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
   gst_rtsp_client_signals[SIGNAL_PRE_SET_PARAMETER_REQUEST] =
       g_signal_new ("pre-set-parameter-request", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstRTSPClientClass,
-          pre_set_parameter_request), pre_signal_accumulator, NULL,
-      g_cclosure_marshal_generic,
+          pre_set_parameter_request), pre_signal_accumulator, NULL, NULL,
       GST_TYPE_RTSP_STATUS_CODE, 1, GST_TYPE_RTSP_CONTEXT);
 
   /**
@@ -457,7 +468,7 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
   gst_rtsp_client_signals[SIGNAL_SET_PARAMETER_REQUEST] =
       g_signal_new ("set-parameter-request", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstRTSPClientClass,
-          set_parameter_request), NULL, NULL, g_cclosure_marshal_generic,
+          set_parameter_request), NULL, NULL, NULL,
       G_TYPE_NONE, 1, GST_TYPE_RTSP_CONTEXT);
 
   /**
@@ -473,9 +484,8 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
   gst_rtsp_client_signals[SIGNAL_PRE_GET_PARAMETER_REQUEST] =
       g_signal_new ("pre-get-parameter-request", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstRTSPClientClass,
-          pre_get_parameter_request), pre_signal_accumulator, NULL,
-      g_cclosure_marshal_generic, GST_TYPE_RTSP_STATUS_CODE, 1,
-      GST_TYPE_RTSP_CONTEXT);
+          pre_get_parameter_request), pre_signal_accumulator, NULL, NULL,
+      GST_TYPE_RTSP_STATUS_CODE, 1, GST_TYPE_RTSP_CONTEXT);
 
   /**
    * GstRTSPClient::get-parameter-request:
@@ -485,7 +495,7 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
   gst_rtsp_client_signals[SIGNAL_GET_PARAMETER_REQUEST] =
       g_signal_new ("get-parameter-request", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstRTSPClientClass,
-          get_parameter_request), NULL, NULL, g_cclosure_marshal_generic,
+          get_parameter_request), NULL, NULL, NULL,
       G_TYPE_NONE, 1, GST_TYPE_RTSP_CONTEXT);
 
   /**
@@ -496,7 +506,7 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
   gst_rtsp_client_signals[SIGNAL_HANDLE_RESPONSE] =
       g_signal_new ("handle-response", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstRTSPClientClass,
-          handle_response), NULL, NULL, g_cclosure_marshal_generic,
+          handle_response), NULL, NULL, NULL,
       G_TYPE_NONE, 1, GST_TYPE_RTSP_CONTEXT);
 
   /**
@@ -508,7 +518,7 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
   gst_rtsp_client_signals[SIGNAL_SEND_MESSAGE] =
       g_signal_new ("send-message", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstRTSPClientClass,
-          send_message), NULL, NULL, g_cclosure_marshal_generic,
+          send_message), NULL, NULL, NULL,
       G_TYPE_NONE, 2, GST_TYPE_RTSP_CONTEXT, G_TYPE_POINTER);
 
   /**
@@ -524,9 +534,8 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
   gst_rtsp_client_signals[SIGNAL_PRE_ANNOUNCE_REQUEST] =
       g_signal_new ("pre-announce-request", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstRTSPClientClass,
-          pre_announce_request), pre_signal_accumulator, NULL,
-      g_cclosure_marshal_generic, GST_TYPE_RTSP_STATUS_CODE, 1,
-      GST_TYPE_RTSP_CONTEXT);
+          pre_announce_request), pre_signal_accumulator, NULL, NULL,
+      GST_TYPE_RTSP_STATUS_CODE, 1, GST_TYPE_RTSP_CONTEXT);
 
   /**
    * GstRTSPClient::announce-request:
@@ -536,8 +545,7 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
   gst_rtsp_client_signals[SIGNAL_ANNOUNCE_REQUEST] =
       g_signal_new ("announce-request", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstRTSPClientClass, announce_request),
-      NULL, NULL, g_cclosure_marshal_generic, G_TYPE_NONE, 1,
-      GST_TYPE_RTSP_CONTEXT);
+      NULL, NULL, NULL, G_TYPE_NONE, 1, GST_TYPE_RTSP_CONTEXT);
 
   /**
    * GstRTSPClient::pre-record-request:
@@ -552,9 +560,8 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
   gst_rtsp_client_signals[SIGNAL_PRE_RECORD_REQUEST] =
       g_signal_new ("pre-record-request", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstRTSPClientClass,
-          pre_record_request), pre_signal_accumulator, NULL,
-      g_cclosure_marshal_generic, GST_TYPE_RTSP_STATUS_CODE, 1,
-      GST_TYPE_RTSP_CONTEXT);
+          pre_record_request), pre_signal_accumulator, NULL, NULL,
+      GST_TYPE_RTSP_STATUS_CODE, 1, GST_TYPE_RTSP_CONTEXT);
 
   /**
    * GstRTSPClient::record-request:
@@ -564,8 +571,7 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
   gst_rtsp_client_signals[SIGNAL_RECORD_REQUEST] =
       g_signal_new ("record-request", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstRTSPClientClass, record_request),
-      NULL, NULL, g_cclosure_marshal_generic, G_TYPE_NONE, 1,
-      GST_TYPE_RTSP_CONTEXT);
+      NULL, NULL, NULL, G_TYPE_NONE, 1, GST_TYPE_RTSP_CONTEXT);
 
   /**
    * GstRTSPClient::check-requirements:
@@ -582,7 +588,7 @@ gst_rtsp_client_class_init (GstRTSPClientClass * klass)
   gst_rtsp_client_signals[SIGNAL_CHECK_REQUIREMENTS] =
       g_signal_new ("check-requirements", G_TYPE_FROM_CLASS (klass),
       G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstRTSPClientClass,
-          check_requirements), NULL, NULL, g_cclosure_marshal_generic,
+          check_requirements), NULL, NULL, NULL,
       G_TYPE_STRING, 2, GST_TYPE_RTSP_CONTEXT, G_TYPE_STRV);
 
   tunnels =
@@ -602,9 +608,9 @@ gst_rtsp_client_init (GstRTSPClient * client)
   g_mutex_init (&priv->lock);
   g_mutex_init (&priv->send_lock);
   g_mutex_init (&priv->watch_lock);
-  priv->close_seq = 0;
   priv->data_seqs = g_array_new (FALSE, FALSE, sizeof (DataSeq));
   priv->drop_backlog = DEFAULT_DROP_BACKLOG;
+  priv->post_session_timeout = DEFAULT_POST_SESSION_TIMEOUT;
   priv->transports =
       g_hash_table_new_full (g_direct_hash, g_direct_equal, NULL,
       g_object_unref);
@@ -756,16 +762,14 @@ gst_rtsp_client_finalize (GObject * obj)
 
   GST_INFO ("finalize client %p", client);
 
-  if (priv->watch)
-    gst_rtsp_watch_set_flushing (priv->watch, TRUE);
+  /* the watch and related state should be cleared before finalize
+   * as the watch actually holds a strong reference to the client */
+  g_assert (priv->watch == NULL);
+  g_assert (priv->watch_context == NULL);
+  g_assert (priv->rtsp_ctrl_timeout == NULL);
+
   gst_rtsp_client_set_send_func (client, NULL, NULL, NULL);
   gst_rtsp_client_set_send_messages_func (client, NULL, NULL, NULL);
-
-  if (priv->watch)
-    g_source_destroy ((GSource *) priv->watch);
-
-  if (priv->watch_context)
-    g_main_context_unref (priv->watch_context);
 
   /* all sessions should have been removed by now. We keep a ref to
    * the client object for the session removed handler. The ref is
@@ -790,14 +794,6 @@ gst_rtsp_client_finalize (GObject * obj)
     g_object_unref (priv->thread_pool);
 
   clean_cached_media (client, TRUE);
-
-  if (priv->rtsp_ctrl_timeout_id != 0) {
-    GST_DEBUG ("Killing leftover timeout GSource for client %p", client);
-    g_source_destroy (g_main_context_find_source_by_id (priv->watch_context,
-            priv->rtsp_ctrl_timeout_id));
-    priv->rtsp_ctrl_timeout_id = 0;
-    priv->rtsp_ctrl_timeout_cnt = 0;
-  }
 
   g_free (priv->server_ip);
   g_mutex_clear (&priv->lock);
@@ -824,6 +820,9 @@ gst_rtsp_client_get_property (GObject * object, guint propid,
     case PROP_DROP_BACKLOG:
       g_value_set_boolean (value, priv->drop_backlog);
       break;
+    case PROP_POST_SESSION_TIMEOUT:
+      g_value_set_int (value, priv->post_session_timeout);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, propid, pspec);
   }
@@ -846,6 +845,11 @@ gst_rtsp_client_set_property (GObject * object, guint propid,
     case PROP_DROP_BACKLOG:
       g_mutex_lock (&priv->lock);
       priv->drop_backlog = g_value_get_boolean (value);
+      g_mutex_unlock (&priv->lock);
+      break;
+    case PROP_POST_SESSION_TIMEOUT:
+      g_mutex_lock (&priv->lock);
+      priv->post_session_timeout = g_value_get_int (value);
       g_mutex_unlock (&priv->lock);
       break;
     default:
@@ -1203,6 +1207,12 @@ do_send_data (GstBuffer * buffer, guint8 channel, GstRTSPClient * client)
 }
 
 static gboolean
+do_check_back_pressure (guint8 channel, GstRTSPClient * client)
+{
+  return get_data_seq (client, channel) != 0;
+}
+
+static gboolean
 do_send_data_list (GstBufferList * buffer_list, guint8 channel,
     GstRTSPClient * client)
 {
@@ -1271,6 +1281,13 @@ gst_rtsp_client_close (GstRTSPClient * client)
 
   GST_DEBUG ("client %p: closing connection", client);
 
+  g_mutex_lock (&priv->watch_lock);
+
+  /* Work around the lack of thread safety of gst_rtsp_connection_close */
+  if (priv->watch) {
+    gst_rtsp_watch_set_flushing (priv->watch, TRUE);
+  }
+
   if (priv->connection) {
     if ((tunnelid = gst_rtsp_connection_get_tunnelid (priv->connection))) {
       g_mutex_lock (&tunnels_lock);
@@ -1278,11 +1295,10 @@ gst_rtsp_client_close (GstRTSPClient * client)
       g_hash_table_remove (tunnels, tunnelid);
       g_mutex_unlock (&tunnels_lock);
     }
+    gst_rtsp_connection_flush (priv->connection, TRUE);
     gst_rtsp_connection_close (priv->connection);
   }
 
-  /* connection is now closed, destroy the watch which will also cause the
-   * closed signal to be emitted */
   if (priv->watch) {
     GST_DEBUG ("client %p: destroying watch", client);
     g_source_destroy ((GSource *) priv->watch);
@@ -1290,9 +1306,14 @@ gst_rtsp_client_close (GstRTSPClient * client)
     gst_rtsp_client_set_send_func (client, NULL, NULL, NULL);
     gst_rtsp_client_set_send_messages_func (client, NULL, NULL, NULL);
     rtsp_ctrl_timeout_remove (priv);
+  }
+
+  if (priv->watch_context) {
     g_main_context_unref (priv->watch_context);
     priv->watch_context = NULL;
   }
+
+  g_mutex_unlock (&priv->watch_lock);
 }
 
 static gchar *
@@ -1356,6 +1377,7 @@ handle_teardown_request (GstRTSPClient * client, GstRTSPContext * ctx)
   GstRTSPClientClass *klass;
   GstRTSPSession *session;
   GstRTSPSessionMedia *sessmedia;
+  GstRTSPMedia *media;
   GstRTSPStatusCode code;
   gchar *path;
   gint matched;
@@ -1386,6 +1408,10 @@ handle_teardown_request (GstRTSPClient * client, GstRTSPContext * ctx)
 
   ctx->sessmedia = sessmedia;
 
+  media = gst_rtsp_session_media_get_media (sessmedia);
+  g_object_ref (media);
+  gst_rtsp_media_lock (media);
+
   g_signal_emit (client, gst_rtsp_client_signals[SIGNAL_PRE_TEARDOWN_REQUEST],
       0, ctx, &sig_result);
   if (sig_result != GST_RTSP_STS_OK) {
@@ -1413,6 +1439,9 @@ handle_teardown_request (GstRTSPClient * client, GstRTSPContext * ctx)
     /* remove the session */
     gst_rtsp_session_pool_remove (priv->session_pool, session);
   }
+
+  gst_rtsp_media_unlock (media);
+  g_object_unref (media);
 
   return TRUE;
 
@@ -1449,6 +1478,8 @@ sig_failed:
     GST_ERROR ("client %p: pre signal returned error: %s", client,
         gst_rtsp_status_as_text (sig_result));
     send_generic_response (client, sig_result, ctx);
+    gst_rtsp_media_unlock (media);
+    g_object_unref (media);
     return FALSE;
   }
 }
@@ -1617,6 +1648,8 @@ handle_pause_request (GstRTSPClient * client, GstRTSPContext * ctx)
   g_free (path);
 
   media = gst_rtsp_session_media_get_media (sessmedia);
+  g_object_ref (media);
+  gst_rtsp_media_lock (media);
   n = gst_rtsp_media_n_streams (media);
   for (i = 0; i < n; i++) {
     GstRTSPStream *stream = gst_rtsp_media_get_stream (media, i);
@@ -1655,6 +1688,9 @@ handle_pause_request (GstRTSPClient * client, GstRTSPContext * ctx)
 
   g_signal_emit (client, gst_rtsp_client_signals[SIGNAL_PAUSE_REQUEST], 0, ctx);
 
+  gst_rtsp_media_unlock (media);
+  g_object_unref (media);
+
   return TRUE;
 
   /* ERRORS */
@@ -1690,6 +1726,8 @@ sig_failed:
     GST_ERROR ("client %p: pre signal returned error: %s", client,
         gst_rtsp_status_as_text (sig_result));
     send_generic_response (client, sig_result, ctx);
+    gst_rtsp_media_unlock (media);
+    g_object_unref (media);
     return FALSE;
   }
 invalid_state:
@@ -1697,12 +1735,16 @@ invalid_state:
     GST_ERROR ("client %p: not PLAYING or RECORDING", client);
     send_generic_response (client, GST_RTSP_STS_METHOD_NOT_VALID_IN_THIS_STATE,
         ctx);
+    gst_rtsp_media_unlock (media);
+    g_object_unref (media);
     return FALSE;
   }
 not_supported:
   {
     GST_ERROR ("client %p: pausing not supported", client);
     send_generic_response (client, GST_RTSP_STS_BAD_REQUEST, ctx);
+    gst_rtsp_media_unlock (media);
+    g_object_unref (media);
     return FALSE;
   }
 }
@@ -1862,7 +1904,17 @@ setup_play_mode (GstRTSPClient * client, GstRTSPContext * ctx,
         flags = GST_SEEK_FLAG_KEY_UNIT & GST_SEEK_FLAG_SNAP_AFTER;
       else
         GST_FIXME_OBJECT (client, "Add support for seek style %s", seek_style);
+    } else if (range->min.type == GST_RTSP_TIME_END) {
+      flags = GST_SEEK_FLAG_ACCURATE;
+    } else {
+      flags = GST_SEEK_FLAG_KEY_UNIT;
     }
+
+    if (seek_style)
+      gst_rtsp_message_add_header (ctx->response, GST_RTSP_HDR_SEEK_STYLE,
+          seek_style);
+  } else {
+    flags = GST_SEEK_FLAG_ACCURATE;
   }
 
   /* check for scale and/or speed headers
@@ -1936,9 +1988,8 @@ handle_play_request (GstRTSPClient * client, GstRTSPContext * ctx)
   gchar *str;
   GstRTSPState rtspstate;
   GstRTSPRangeUnit unit = GST_RTSP_RANGE_NPT;
-  gchar *path, *rtpinfo;
+  gchar *path, *rtpinfo = NULL;
   gint matched;
-  gchar *seek_style = NULL;
   GstRTSPStatusCode sig_result;
   GPtrArray *transports;
   gboolean scale_present;
@@ -1967,6 +2018,9 @@ handle_play_request (GstRTSPClient * client, GstRTSPContext * ctx)
 
   ctx->sessmedia = sessmedia;
   ctx->media = media = gst_rtsp_session_media_get_media (sessmedia);
+
+  g_object_ref (media);
+  gst_rtsp_media_lock (media);
 
   g_signal_emit (client, gst_rtsp_client_signals[SIGNAL_PRE_PLAY_REQUEST], 0,
       ctx, &sig_result);
@@ -2000,7 +2054,9 @@ handle_play_request (GstRTSPClient * client, GstRTSPContext * ctx)
     goto invalid_mode;
 
   /* grab RTPInfo from the media now */
-  rtpinfo = gst_rtsp_session_media_get_rtpinfo (sessmedia);
+  if (gst_rtsp_media_has_completed_sender (media) &&
+      !(rtpinfo = gst_rtsp_session_media_get_rtpinfo (sessmedia)))
+    goto rtp_info_error;
 
   /* construct the response now */
   code = GST_RTSP_STS_OK;
@@ -2011,16 +2067,13 @@ handle_play_request (GstRTSPClient * client, GstRTSPContext * ctx)
   if (rtpinfo)
     gst_rtsp_message_take_header (ctx->response, GST_RTSP_HDR_RTP_INFO,
         rtpinfo);
-  if (seek_style)
-    gst_rtsp_message_add_header (ctx->response, GST_RTSP_HDR_SEEK_STYLE,
-        seek_style);
 
   /* add the range */
   str = gst_rtsp_media_get_range_string (media, TRUE, unit);
   if (str)
     gst_rtsp_message_take_header (ctx->response, GST_RTSP_HDR_RANGE, str);
 
-  if (!gst_rtsp_media_is_receive_only (media)) {
+  if (gst_rtsp_media_has_completed_sender (media)) {
     /* the scale and speed headers must always be added if they were present in
      * the request. however, even if they were not, we still add them if
      * applied_rate or rate deviate from the "normal", i.e. 1.0 */
@@ -2051,6 +2104,9 @@ handle_play_request (GstRTSPClient * client, GstRTSPContext * ctx)
   gst_rtsp_session_media_set_rtsp_state (sessmedia, GST_RTSP_STATE_PLAYING);
 
   g_signal_emit (client, gst_rtsp_client_signals[SIGNAL_PLAY_REQUEST], 0, ctx);
+
+  gst_rtsp_media_unlock (media);
+  g_object_unref (media);
 
   return TRUE;
 
@@ -2086,6 +2142,8 @@ sig_failed:
     GST_ERROR ("client %p: pre signal returned error: %s", client,
         gst_rtsp_status_as_text (sig_result));
     send_generic_response (client, sig_result, ctx);
+    gst_rtsp_media_unlock (media);
+    g_object_unref (media);
     return FALSE;
   }
 invalid_state:
@@ -2093,6 +2151,8 @@ invalid_state:
     GST_ERROR ("client %p: not PLAYING or READY", client);
     send_generic_response (client, GST_RTSP_STS_METHOD_NOT_VALID_IN_THIS_STATE,
         ctx);
+    gst_rtsp_media_unlock (media);
+    g_object_unref (media);
     return FALSE;
   }
 pipeline_error:
@@ -2100,36 +2160,56 @@ pipeline_error:
     GST_ERROR ("client %p: failed to configure the pipeline", client);
     send_generic_response (client, GST_RTSP_STS_METHOD_NOT_VALID_IN_THIS_STATE,
         ctx);
+    gst_rtsp_media_unlock (media);
+    g_object_unref (media);
     return FALSE;
   }
 unsuspend_failed:
   {
     GST_ERROR ("client %p: unsuspend failed", client);
     send_generic_response (client, GST_RTSP_STS_SERVICE_UNAVAILABLE, ctx);
+    gst_rtsp_media_unlock (media);
+    g_object_unref (media);
     return FALSE;
   }
 invalid_mode:
   {
     GST_ERROR ("client %p: seek failed", client);
     send_generic_response (client, code, ctx);
+    gst_rtsp_media_unlock (media);
+    g_object_unref (media);
     return FALSE;
   }
 unsupported_mode:
   {
     GST_ERROR ("client %p: media does not support PLAY", client);
     send_generic_response (client, GST_RTSP_STS_METHOD_NOT_ALLOWED, ctx);
+    gst_rtsp_media_unlock (media);
+    g_object_unref (media);
     return FALSE;
   }
 get_rates_error:
   {
     GST_ERROR ("client %p: failed obtaining rate and applied_rate", client);
     send_generic_response (client, GST_RTSP_STS_INTERNAL_SERVER_ERROR, ctx);
+    gst_rtsp_media_unlock (media);
+    g_object_unref (media);
     return FALSE;
   }
 adjust_play_response_failed:
   {
     GST_ERROR ("client %p: failed to adjust play response", client);
     send_generic_response (client, code, ctx);
+    gst_rtsp_media_unlock (media);
+    g_object_unref (media);
+    return FALSE;
+  }
+rtp_info_error:
+  {
+    GST_ERROR ("client %p: failed to add RTP-Info", client);
+    send_generic_response (client, GST_RTSP_STS_INTERNAL_SERVER_ERROR, ctx);
+    gst_rtsp_media_unlock (media);
+    g_object_unref (media);
     return FALSE;
   }
 }
@@ -2468,11 +2548,15 @@ rtsp_ctrl_timeout_cb (gpointer user_data)
 
   priv->rtsp_ctrl_timeout_cnt += RTSP_CTRL_CB_INTERVAL;
 
-  if (priv->rtsp_ctrl_timeout_cnt > RTSP_CTRL_TIMEOUT_VALUE) {
-    GST_DEBUG ("rtsp control session timeout id=%u expired, closing client.",
-        priv->rtsp_ctrl_timeout_id);
+  if ((!priv->had_session
+          && priv->rtsp_ctrl_timeout_cnt > RTSP_CTRL_TIMEOUT_VALUE)
+      || (priv->had_session
+          && priv->rtsp_ctrl_timeout_cnt > priv->post_session_timeout)) {
+    GST_DEBUG ("rtsp control session timeout %p expired, closing client.",
+        priv->rtsp_ctrl_timeout);
     g_mutex_lock (&priv->lock);
-    priv->rtsp_ctrl_timeout_id = 0;
+    g_source_unref (priv->rtsp_ctrl_timeout);
+    priv->rtsp_ctrl_timeout = NULL;
     priv->rtsp_ctrl_timeout_cnt = 0;
     g_mutex_unlock (&priv->lock);
     gst_rtsp_client_close (client);
@@ -2488,12 +2572,12 @@ rtsp_ctrl_timeout_remove (GstRTSPClientPrivate * priv)
 {
   g_mutex_lock (&priv->lock);
 
-  if (priv->rtsp_ctrl_timeout_id != 0) {
-    g_source_destroy (g_main_context_find_source_by_id (priv->watch_context,
-            priv->rtsp_ctrl_timeout_id));
-    GST_DEBUG ("rtsp control session removed timeout id=%u.",
-        priv->rtsp_ctrl_timeout_id);
-    priv->rtsp_ctrl_timeout_id = 0;
+  if (priv->rtsp_ctrl_timeout != NULL) {
+    GST_DEBUG ("rtsp control session removed timeout %p.",
+        priv->rtsp_ctrl_timeout);
+    g_source_destroy (priv->rtsp_ctrl_timeout);
+    g_source_unref (priv->rtsp_ctrl_timeout);
+    priv->rtsp_ctrl_timeout = NULL;
     priv->rtsp_ctrl_timeout_cnt = 0;
   }
 
@@ -2634,13 +2718,17 @@ handle_setup_request (GstRTSPClient * client, GstRTSPContext * ctx)
     /* get a handle to the configuration of the media in the session */
     media = find_media (client, ctx, path, &matched);
     /* need to suspend the media, if the protocol has changed */
-    if (media != NULL)
+    if (media != NULL) {
+      gst_rtsp_media_lock (media);
       gst_rtsp_media_suspend (media);
+    }
   } else {
-    if ((media = gst_rtsp_session_media_get_media (sessmedia)))
+    if ((media = gst_rtsp_session_media_get_media (sessmedia))) {
       g_object_ref (media);
-    else
+      gst_rtsp_media_lock (media);
+    } else {
       goto media_not_found;
+    }
   }
   /* no media, not found then */
   if (media == NULL)
@@ -2700,6 +2788,8 @@ handle_setup_request (GstRTSPClient * client, GstRTSPContext * ctx)
         g_strdup (pipelined_request_id),
         g_strdup (gst_rtsp_session_get_sessionid (session)));
   }
+  /* Remember that we had at least one session in the past */
+  priv->had_session = TRUE;
   rtsp_ctrl_timeout_remove (priv);
 
   if (!klass->configure_client_media (client, media, stream, ctx))
@@ -2791,6 +2881,9 @@ handle_setup_request (GstRTSPClient * client, GstRTSPContext * ctx)
         (GstRTSPSendListFunc) do_send_data_list,
         (GstRTSPSendListFunc) do_send_data_list, client, NULL);
 
+    gst_rtsp_stream_transport_set_back_pressure_callback (trans,
+        (GstRTSPBackPressureFunc) do_check_back_pressure, client, NULL);
+
     g_hash_table_insert (priv->transports,
         GINT_TO_POINTER (ct->interleaved.min), trans);
     g_object_ref (trans);
@@ -2856,11 +2949,13 @@ handle_setup_request (GstRTSPClient * client, GstRTSPContext * ctx)
       gst_rtsp_session_media_set_rtsp_state (sessmedia, GST_RTSP_STATE_READY);
       break;
   }
+
+  g_signal_emit (client, gst_rtsp_client_signals[SIGNAL_SETUP_REQUEST], 0, ctx);
+
+  gst_rtsp_media_unlock (media);
   g_object_unref (media);
   g_object_unref (session);
   g_free (path);
-
-  g_signal_emit (client, gst_rtsp_client_signals[SIGNAL_SETUP_REQUEST], 0, ctx);
 
   return TRUE;
 
@@ -2899,6 +2994,7 @@ control_not_found:
   {
     GST_ERROR ("client %p: no control in path '%s'", client, path);
     send_generic_response (client, GST_RTSP_STS_NOT_FOUND, ctx);
+    gst_rtsp_media_unlock (media);
     g_object_unref (media);
     goto cleanup_session;
   }
@@ -2907,6 +3003,7 @@ stream_not_found:
     GST_ERROR ("client %p: stream '%s' not found", client,
         GST_STR_NULL (control));
     send_generic_response (client, GST_RTSP_STS_NOT_FOUND, ctx);
+    gst_rtsp_media_unlock (media);
     g_object_unref (media);
     goto cleanup_session;
   }
@@ -2915,6 +3012,7 @@ sig_failed:
     GST_ERROR ("client %p: pre signal returned error: %s", client,
         gst_rtsp_status_as_text (sig_result));
     send_generic_response (client, sig_result, ctx);
+    gst_rtsp_media_unlock (media);
     g_object_unref (media);
     goto cleanup_path;
   }
@@ -2922,6 +3020,7 @@ service_unavailable:
   {
     GST_ERROR ("client %p: can't create session", client);
     send_generic_response (client, GST_RTSP_STS_SERVICE_UNAVAILABLE, ctx);
+    gst_rtsp_media_unlock (media);
     g_object_unref (media);
     goto cleanup_session;
   }
@@ -2934,6 +3033,7 @@ sessmedia_unavailable:
 configure_media_failed_no_reply:
   {
     GST_ERROR ("client %p: configure_media failed", client);
+    gst_rtsp_media_unlock (media);
     g_object_unref (media);
     /* error reply is already sent */
     goto cleanup_session;
@@ -2977,8 +3077,10 @@ keymgmt_error:
   {
   cleanup_transport:
     gst_rtsp_transport_free (ct);
-    if (media)
+    if (media) {
+      gst_rtsp_media_unlock (media);
       g_object_unref (media);
+    }
   cleanup_session:
     if (new_session)
       gst_rtsp_session_pool_remove (priv->session_pool, session);
@@ -3091,6 +3193,8 @@ handle_describe_request (GstRTSPClient * client, GstRTSPContext * ctx)
   if (!(media = find_media (client, ctx, path, NULL)))
     goto no_media;
 
+  gst_rtsp_media_lock (media);
+
   if (!(gst_rtsp_media_get_transport_mode (media) &
           GST_RTSP_TRANSPORT_MODE_PLAY))
     goto unsupported_mode;
@@ -3101,7 +3205,6 @@ handle_describe_request (GstRTSPClient * client, GstRTSPContext * ctx)
 
   /* we suspend after the describe */
   gst_rtsp_media_suspend (media);
-  g_object_unref (media);
 
   gst_rtsp_message_init_response (ctx->response, GST_RTSP_STS_OK,
       gst_rtsp_status_as_text (GST_RTSP_STS_OK), ctx->request);
@@ -3125,6 +3228,9 @@ handle_describe_request (GstRTSPClient * client, GstRTSPContext * ctx)
 
   g_signal_emit (client, gst_rtsp_client_signals[SIGNAL_DESCRIBE_REQUEST],
       0, ctx);
+
+  gst_rtsp_media_unlock (media);
+  g_object_unref (media);
 
   return TRUE;
 
@@ -3166,6 +3272,7 @@ unsupported_mode:
     GST_ERROR ("client %p: media does not support DESCRIBE", client);
     send_generic_response (client, GST_RTSP_STS_METHOD_NOT_ALLOWED, ctx);
     g_free (path);
+    gst_rtsp_media_unlock (media);
     g_object_unref (media);
     return FALSE;
   }
@@ -3174,6 +3281,7 @@ no_sdp:
     GST_ERROR ("client %p: can't create SDP", client);
     send_generic_response (client, GST_RTSP_STS_SERVICE_UNAVAILABLE, ctx);
     g_free (path);
+    gst_rtsp_media_unlock (media);
     g_object_unref (media);
     return FALSE;
   }
@@ -3270,6 +3378,7 @@ handle_announce_request (GstRTSPClient * client, GstRTSPContext * ctx)
     goto no_media;
 
   ctx->media = media;
+  gst_rtsp_media_lock (media);
 
   g_signal_emit (client, gst_rtsp_client_signals[SIGNAL_PRE_ANNOUNCE_REQUEST],
       0, ctx, &sig_result);
@@ -3291,21 +3400,22 @@ handle_announce_request (GstRTSPClient * client, GstRTSPContext * ctx)
   n_streams = gst_rtsp_media_n_streams (media);
   for (i = 0; i < n_streams; i++) {
     GstRTSPStream *stream = gst_rtsp_media_get_stream (media, i);
-    gchar *location =
-        g_strdup_printf ("rtsp://%s%s:8554/stream=%d", priv->server_ip, path,
-        i);
-    gchar *keymgmt = stream_make_keymgmt (client, location, stream);
+    gchar *uri, *location, *keymgmt;
+
+    uri = gst_rtsp_url_get_request_uri (ctx->uri);
+    location = g_strdup_printf ("%s/stream=%d", uri, i);
+    keymgmt = stream_make_keymgmt (client, location, stream);
 
     if (keymgmt)
       gst_rtsp_message_take_header (ctx->response, GST_RTSP_HDR_KEYMGMT,
           keymgmt);
 
     g_free (location);
+    g_free (uri);
   }
 
   /* we suspend after the announce */
   gst_rtsp_media_suspend (media);
-  g_object_unref (media);
 
   send_message (client, ctx, ctx->response, FALSE);
 
@@ -3314,6 +3424,9 @@ handle_announce_request (GstRTSPClient * client, GstRTSPContext * ctx)
 
   gst_sdp_message_free (sdp);
   g_free (path);
+  gst_rtsp_media_unlock (media);
+  g_object_unref (media);
+
   return TRUE;
 
 no_uri:
@@ -3368,6 +3481,8 @@ sig_failed:
         gst_rtsp_status_as_text (sig_result));
     send_generic_response (client, sig_result, ctx);
     gst_sdp_message_free (sdp);
+    gst_rtsp_media_unlock (media);
+    g_object_unref (media);
     return FALSE;
   }
 unsupported_mode:
@@ -3375,6 +3490,7 @@ unsupported_mode:
     GST_ERROR ("client %p: media does not support ANNOUNCE", client);
     send_generic_response (client, GST_RTSP_STS_METHOD_NOT_ALLOWED, ctx);
     g_free (path);
+    gst_rtsp_media_unlock (media);
     g_object_unref (media);
     gst_sdp_message_free (sdp);
     return FALSE;
@@ -3384,6 +3500,7 @@ unhandled_sdp:
     GST_ERROR ("client %p: can't handle SDP", client);
     send_generic_response (client, GST_RTSP_STS_UNSUPPORTED_MEDIA_TYPE, ctx);
     g_free (path);
+    gst_rtsp_media_unlock (media);
     g_object_unref (media);
     gst_sdp_message_free (sdp);
     return FALSE;
@@ -3615,12 +3732,32 @@ client_session_removed (GstRTSPSessionPool * pool, GstRTSPSession * session,
     GstRTSPClient * client)
 {
   GstRTSPClientPrivate *priv = client->priv;
+  GSource *timer_src;
 
   GST_INFO ("client %p: session %p removed", client, session);
 
   g_mutex_lock (&priv->lock);
   client_unwatch_session (client, session, NULL);
-  g_mutex_unlock (&priv->lock);
+
+  if (!priv->sessions && priv->rtsp_ctrl_timeout == NULL) {
+    if (priv->post_session_timeout > 0) {
+      timer_src = g_timeout_source_new_seconds (RTSP_CTRL_CB_INTERVAL);
+      g_source_set_callback (timer_src, rtsp_ctrl_timeout_cb, client, NULL);
+      priv->rtsp_ctrl_timeout_cnt = 0;
+      g_source_attach (timer_src, priv->watch_context);
+      priv->rtsp_ctrl_timeout = timer_src;
+      GST_DEBUG ("rtsp control setting up connection timeout %p.",
+          priv->rtsp_ctrl_timeout);
+      g_mutex_unlock (&priv->lock);
+    } else if (priv->post_session_timeout == 0) {
+      g_mutex_unlock (&priv->lock);
+      gst_rtsp_client_close (client);
+    } else {
+      g_mutex_unlock (&priv->lock);
+    }
+  } else {
+    g_mutex_unlock (&priv->lock);
+  }
 }
 
 /* Check for Require headers. Returns TRUE if there are no Require headers,
@@ -4629,14 +4766,12 @@ do_send_messages (GstRTSPClient * client, GstRTSPMessage * messages,
   guint i;
 
   /* send the message */
+  if (close)
+    GST_INFO ("client %p: sending close message", client);
+
   ret = gst_rtsp_watch_send_messages (priv->watch, messages, n_messages, &id);
   if (ret != GST_RTSP_OK)
     goto error;
-
-  /* if close flag is set, store the seq number so we can wait until it's
-   * written to the client to close the connection */
-  if (close)
-    priv->close_seq = id;
 
   for (i = 0; i < n_messages; i++) {
     if (gst_rtsp_message_get_type (&messages[i]) == GST_RTSP_MESSAGE_DATA) {
@@ -4698,7 +4833,6 @@ message_sent (GstRTSPWatch * watch, guint cseq, gpointer user_data)
   GstRTSPClientPrivate *priv = client->priv;
   GstRTSPStreamTransport *trans = NULL;
   guint8 channel = 0;
-  gboolean close = FALSE;
 
   g_mutex_lock (&priv->send_lock);
 
@@ -4706,22 +4840,12 @@ message_sent (GstRTSPWatch * watch, guint cseq, gpointer user_data)
     trans = g_hash_table_lookup (priv->transports, GINT_TO_POINTER (channel));
     set_data_seq (client, channel, 0);
   }
-
-  if (priv->close_seq && priv->close_seq == cseq) {
-    GST_INFO ("client %p: send close message", client);
-    close = TRUE;
-    priv->close_seq = 0;
-  }
-
   g_mutex_unlock (&priv->send_lock);
 
   if (trans) {
     GST_DEBUG_OBJECT (client, "emit 'message-sent' signal");
     gst_rtsp_stream_transport_message_sent (trans);
   }
-
-  if (close)
-    gst_rtsp_client_close (client);
 
   return GST_RTSP_OK;
 }
@@ -4918,6 +5042,12 @@ handle_tunnel (GstRTSPClient * client)
     priv->watch = NULL;
     gst_rtsp_client_set_send_func (client, NULL, NULL, NULL);
     gst_rtsp_client_set_send_messages_func (client, NULL, NULL, NULL);
+    rtsp_ctrl_timeout_remove (priv);
+  }
+
+  if (priv->watch_context) {
+    g_main_context_unref (priv->watch_context);
+    priv->watch_context = NULL;
   }
 
   return GST_RTSP_STS_OK;
@@ -5014,8 +5144,15 @@ client_watch_notify (GstRTSPClient * client)
   GST_INFO ("client %p: watch destroyed", client);
   priv->watch = NULL;
   /* remove all sessions if the media says so and so drop the extra client ref */
+  gst_rtsp_client_set_send_func (client, NULL, NULL, NULL);
+  gst_rtsp_client_set_send_messages_func (client, NULL, NULL, NULL);
   rtsp_ctrl_timeout_remove (priv);
   gst_rtsp_client_session_filter (client, cleanup_session, &closed);
+  if (priv->watch_context) {
+    g_main_context_unref (priv->watch_context);
+    priv->watch_context = NULL;
+  }
+
   if (closed)
     g_signal_emit (client, gst_rtsp_client_signals[SIGNAL_CLOSED], 0, NULL);
   g_object_unref (client);
@@ -5069,10 +5206,10 @@ gst_rtsp_client_attach (GstRTSPClient * client, GMainContext * context)
 
   timer_src = g_timeout_source_new_seconds (RTSP_CTRL_CB_INTERVAL);
   g_source_set_callback (timer_src, rtsp_ctrl_timeout_cb, client, NULL);
-  priv->rtsp_ctrl_timeout_id = g_source_attach (timer_src, priv->watch_context);
-  g_source_unref (timer_src);
-  GST_DEBUG ("rtsp control setting up session timeout id=%u.",
-      priv->rtsp_ctrl_timeout_id);
+  g_source_attach (timer_src, priv->watch_context);
+  priv->rtsp_ctrl_timeout = timer_src;
+  GST_DEBUG ("rtsp control setting up session timeout %p.",
+      priv->rtsp_ctrl_timeout);
 
   g_mutex_unlock (&priv->lock);
 
