@@ -1066,11 +1066,14 @@ gst_rtsp_media_set_suspend_mode (GstRTSPMedia * media, GstRTSPSuspendMode mode)
 
   priv = media->priv;
 
+  GST_DEBUG_OBJECT(media, "try lock state_lock");
   g_rec_mutex_lock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
   if (priv->status == GST_RTSP_MEDIA_STATUS_PREPARED)
     goto was_prepared;
   priv->suspend_mode = mode;
   g_rec_mutex_unlock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "unlock state_lock");
 
   return;
 
@@ -1079,6 +1082,7 @@ was_prepared:
   {
     GST_WARNING ("media %p was prepared", media);
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
   }
 }
 
@@ -1100,9 +1104,12 @@ gst_rtsp_media_get_suspend_mode (GstRTSPMedia * media)
 
   priv = media->priv;
 
+  GST_DEBUG_OBJECT(media, "try lock state_lock");
   g_rec_mutex_lock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
   res = priv->suspend_mode;
   g_rec_mutex_unlock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "unlock state_lock");
 
   return res;
 }
@@ -2535,7 +2542,9 @@ gst_rtsp_media_get_range_string (GstRTSPMedia * media, gboolean play,
 
   priv = media->priv;
 
+  GST_DEBUG_OBJECT(media, "try lock state_lock");
   g_rec_mutex_lock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
   if (priv->status != GST_RTSP_MEDIA_STATUS_PREPARED &&
       priv->status != GST_RTSP_MEDIA_STATUS_SUSPENDED)
     goto not_prepared;
@@ -2553,6 +2562,7 @@ gst_rtsp_media_get_range_string (GstRTSPMedia * media, gboolean play,
   }
   g_mutex_unlock (&priv->lock);
   g_rec_mutex_unlock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "unlock state_lock");
 
   if (!klass->convert_range (media, &range, unit))
     goto conversion_failed;
@@ -2566,6 +2576,7 @@ not_prepared:
   {
     GST_WARNING ("media %p was not prepared", media);
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     return NULL;
   }
 conversion_failed:
@@ -2767,7 +2778,9 @@ gst_rtsp_media_seek_trickmode (GstRTSPMedia * media,
 
   priv = media->priv;
 
+  GST_DEBUG_OBJECT(media, "try lock state_lock");
   g_rec_mutex_lock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
   if (priv->status != GST_RTSP_MEDIA_STATUS_PREPARED)
     goto not_prepared;
 
@@ -2867,12 +2880,15 @@ gst_rtsp_media_seek_trickmode (GstRTSPMedia * media,
         GST_DEBUG (" expected to get async-done, waiting ");
         gst_rtsp_media_set_status (media, GST_RTSP_MEDIA_STATUS_PREPARING);
         g_rec_mutex_unlock (&priv->state_lock);
+        GST_DEBUG_OBJECT(media, "unlock state_lock");
 
         /* wait until pipeline is prerolled  */
         if (!wait_preroll (media))
           goto preroll_failed_expected_async_done;
 
-        g_rec_mutex_lock (&priv->state_lock);
+        GST_DEBUG_OBJECT(media, "try lock state_lock");
+  g_rec_mutex_lock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
         GST_DEBUG (" got expected async-done");
       }
 
@@ -2914,12 +2930,15 @@ gst_rtsp_media_seek_trickmode (GstRTSPMedia * media,
         goto seek_failed;
 
       g_rec_mutex_unlock (&priv->state_lock);
+      GST_DEBUG_OBJECT(media, "unlock state_lock");
 
       /* wait until pipeline is prerolled again, this will also collect stats */
       if (!wait_preroll (media))
         goto preroll_failed;
 
-      g_rec_mutex_lock (&priv->state_lock);
+      GST_DEBUG_OBJECT(media, "try lock state_lock");
+  g_rec_mutex_lock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
       GST_INFO ("prerolled again");
     }
   } else {
@@ -2927,6 +2946,7 @@ gst_rtsp_media_seek_trickmode (GstRTSPMedia * media,
     res = TRUE;
   }
   g_rec_mutex_unlock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "unlock state_lock");
 
   return res;
 
@@ -2934,30 +2954,35 @@ gst_rtsp_media_seek_trickmode (GstRTSPMedia * media,
 not_prepared:
   {
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     GST_INFO ("media %p is not prepared", media);
     return FALSE;
   }
 not_complete:
   {
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     GST_INFO ("pipeline is not complete");
     return FALSE;
   }
 not_seekable:
   {
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     GST_INFO ("pipeline is not seekable");
     return FALSE;
   }
 not_supported:
   {
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     GST_WARNING ("conversion to npt not supported");
     return FALSE;
   }
 seek_failed:
   {
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     GST_INFO ("seeking failed");
     gst_rtsp_media_set_status (media, GST_RTSP_MEDIA_STATUS_ERROR);
     return FALSE;
@@ -3219,13 +3244,16 @@ bus_message (GstBus * bus, GstMessage * message, GstRTSPMedia * media)
   gboolean ret;
 
   klass = GST_RTSP_MEDIA_GET_CLASS (media);
-
+  GST_DEBUG_OBJECT(media, "try to lock state_lock");
   g_rec_mutex_lock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
   if (klass->handle_message)
     ret = klass->handle_message (media, message);
   else
     ret = FALSE;
   g_rec_mutex_unlock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "unlock state_lock");
+  GST_DEBUG_OBJECT(media, "Done.");
 
   return ret;
 }
@@ -3317,7 +3345,9 @@ pad_added_cb (GstElement * element, GstPad * pad, GstRTSPMedia * media)
 
   GST_INFO ("pad added %s:%s, stream %p", GST_DEBUG_PAD_NAME (pad), stream);
 
+  GST_DEBUG_OBJECT(media, "try lock state_lock");
   g_rec_mutex_lock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
   if (priv->status != GST_RTSP_MEDIA_STATUS_PREPARING)
     goto not_preparing;
 
@@ -3334,6 +3364,7 @@ pad_added_cb (GstElement * element, GstPad * pad, GstRTSPMedia * media)
     gst_rtsp_stream_set_blocked (stream, TRUE);
 
   g_rec_mutex_unlock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "unlock state_lock");
 
   return;
 
@@ -3342,6 +3373,7 @@ not_preparing:
   {
     gst_rtsp_media_remove_stream (media, stream);
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     GST_INFO ("ignore pad because we are not preparing");
     return;
   }
@@ -3359,9 +3391,12 @@ pad_removed_cb (GstElement * element, GstPad * pad, GstRTSPMedia * media)
 
   GST_INFO ("pad removed %s:%s, stream %p", GST_DEBUG_PAD_NAME (pad), stream);
 
+  GST_DEBUG_OBJECT(media, "try lock state_lock");
   g_rec_mutex_lock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
   gst_rtsp_stream_leave_bin (stream, GST_BIN (priv->pipeline), priv->rtpbin);
   g_rec_mutex_unlock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "unlock state_lock");
 
   gst_rtsp_media_remove_stream (media, stream);
 }
@@ -3538,11 +3573,13 @@ new_storage_cb (GstElement * rtpbin, GObject * storage, guint sessid,
 static gboolean
 start_prepare (GstRTSPMedia * media)
 {
+  GST_DEBUG_OBJECT(media, "start");
   GstRTSPMediaPrivate *priv = media->priv;
   guint i;
   GList *walk;
-
+  GST_DEBUG_OBJECT(media, "try to get state_lock");
   g_rec_mutex_lock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
   if (priv->status != GST_RTSP_MEDIA_STATUS_PREPARING)
     goto no_longer_preparing;
 
@@ -3557,6 +3594,7 @@ start_prepare (GstRTSPMedia * media)
     GstRTSPStream *stream;
 
     stream = g_ptr_array_index (priv->streams, i);
+    GST_DEBUG_OBJECT(media, "prepare %dth stream %p", i, stream);
 
     if (priv->rtx_time > 0) {
       /* enable retransmission by setting rtprtxsend as the "aux" element of rtpbin */
@@ -3605,6 +3643,8 @@ start_prepare (GstRTSPMedia * media)
   }
 
   g_rec_mutex_unlock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "unlock state_lock");
+    GST_DEBUG_OBJECT(media, "Done.");
 
   return FALSE;
 
@@ -3612,6 +3652,7 @@ no_longer_preparing:
   {
     GST_INFO ("media is no longer preparing");
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     return FALSE;
   }
 join_bin_failed:
@@ -3619,6 +3660,7 @@ join_bin_failed:
     GST_WARNING ("failed to join bin element");
     gst_rtsp_media_set_status (media, GST_RTSP_MEDIA_STATUS_ERROR);
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     return FALSE;
   }
 preroll_failed:
@@ -3626,6 +3668,7 @@ preroll_failed:
     GST_WARNING ("failed to preroll pipeline");
     gst_rtsp_media_set_status (media, GST_RTSP_MEDIA_STATUS_ERROR);
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     return FALSE;
   }
 }
@@ -3665,9 +3708,9 @@ default_prepare (GstRTSPMedia * media, GstRTSPThread * thread)
 
   priv->thread = thread;
   context = (thread != NULL) ? (thread->context) : NULL;
-
+  GST_DEBUG_OBJECT(media, "try to get bus.");
   bus = gst_pipeline_get_bus (GST_PIPELINE_CAST (priv->pipeline));
-
+  GST_DEBUG_OBJECT(media, "try create watch on bus.");
   /* add the pipeline bus to our custom mainloop */
   priv->source = gst_bus_create_watch (bus);
   gst_object_unref (bus);
@@ -3676,7 +3719,7 @@ default_prepare (GstRTSPMedia * media, GstRTSPThread * thread)
       g_object_ref (media), (GDestroyNotify) watch_destroyed);
 
   priv->id = g_source_attach (priv->source, context);
-
+  GST_DEBUG_OBJECT(media, "add rtpbin to pipeline.");
   /* add stuff to the bin */
   gst_bin_add (GST_BIN (priv->pipeline), priv->rtpbin);
 
@@ -3686,7 +3729,7 @@ default_prepare (GstRTSPMedia * media, GstRTSPThread * thread)
       g_object_ref (media), (GDestroyNotify) g_object_unref);
   g_source_attach (source, context);
   g_source_unref (source);
-
+  GST_DEBUG_OBJECT(media, "Done.");
   return TRUE;
 
   /* ERRORS */
@@ -3728,8 +3771,9 @@ gst_rtsp_media_prepare (GstRTSPMedia * media, GstRTSPThread * thread)
   g_return_val_if_fail (GST_IS_RTSP_MEDIA (media), FALSE);
 
   priv = media->priv;
-
+  GST_DEBUG_OBJECT(media, "try lock state_lock");
   g_rec_mutex_lock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
   priv->prepare_count++;
 
   if (priv->status == GST_RTSP_MEDIA_STATUS_PREPARED ||
@@ -3764,6 +3808,7 @@ gst_rtsp_media_prepare (GstRTSPMedia * media, GstRTSPThread * thread)
 
 wait_status:
   g_rec_mutex_unlock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "unlock state_lock");
 
   /* now wait for all pads to be prerolled, FIXME, we should somehow be
    * able to do this async so that we don't block the server thread. */
@@ -3791,6 +3836,7 @@ was_prepared:
     if (thread)
       gst_rtsp_thread_stop (thread);
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     return TRUE;
   }
   /* ERRORS */
@@ -3802,6 +3848,7 @@ not_unprepared:
     GST_WARNING ("media %p was not unprepared", media);
     priv->prepare_count--;
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     return FALSE;
   }
 is_reused:
@@ -3811,6 +3858,7 @@ is_reused:
       gst_rtsp_thread_stop (thread);
     priv->prepare_count--;
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     GST_WARNING ("can not reuse media %p", media);
     return FALSE;
   }
@@ -3821,6 +3869,7 @@ prepare_failed:
       gst_rtsp_thread_stop (thread);
     priv->prepare_count--;
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     GST_ERROR ("failed to prepare media");
     return FALSE;
   }
@@ -3849,8 +3898,11 @@ finish_unprepare (GstRTSPMedia * media)
   /* release the lock on shutdown, otherwise pad_added_cb might try to
    * acquire the lock and then we deadlock */
   g_rec_mutex_unlock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "unlock state_lock");
   set_state (media, GST_STATE_NULL);
+  GST_DEBUG_OBJECT(media, "try lock state_lock");
   g_rec_mutex_lock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
 
   media_streams_set_blocked (media, FALSE);
 
@@ -3951,7 +4003,9 @@ gst_rtsp_media_unprepare (GstRTSPMedia * media)
 
   priv = media->priv;
 
+  GST_DEBUG_OBJECT(media, "try lock state_lock");
   g_rec_mutex_lock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
   if (priv->status == GST_RTSP_MEDIA_STATUS_UNPREPARED)
     goto was_unprepared;
 
@@ -3974,12 +4028,14 @@ gst_rtsp_media_unprepare (GstRTSPMedia * media)
     finish_unprepare (media);
   }
   g_rec_mutex_unlock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "unlock state_lock");
 
   return success;
 
 was_unprepared:
   {
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     GST_INFO ("media %p was already unprepared", media);
     return TRUE;
   }
@@ -3987,6 +4043,7 @@ is_busy:
   {
     GST_INFO ("media %p still prepared %d times", media, priv->prepare_count);
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     return TRUE;
   }
 }
@@ -4069,11 +4126,13 @@ gst_rtsp_media_get_clock (GstRTSPMedia * media)
   g_return_val_if_fail (GST_IS_RTSP_MEDIA (media), NULL);
 
   priv = media->priv;
-
+  GST_DEBUG_OBJECT(media, "try to lock state_lock");
   g_rec_mutex_lock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
   clock = get_clock_unlocked (media);
   g_rec_mutex_unlock (&priv->state_lock);
-
+  GST_DEBUG_OBJECT(media, "unlock state_lock");
+  GST_DEBUG_OBJECT(media, "Done.");
   return clock;
 }
 
@@ -4097,12 +4156,15 @@ gst_rtsp_media_get_base_time (GstRTSPMedia * media)
 
   priv = media->priv;
 
+  GST_DEBUG_OBJECT(media, "try lock state_lock");
   g_rec_mutex_lock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
   if (media->priv->status != GST_RTSP_MEDIA_STATUS_PREPARED)
     goto not_prepared;
 
   result = gst_element_get_base_time (media->priv->pipeline);
   g_rec_mutex_unlock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "unlock state_lock");
 
   return result;
 
@@ -4110,6 +4172,7 @@ gst_rtsp_media_get_base_time (GstRTSPMedia * media)
 not_prepared:
   {
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     GST_DEBUG_OBJECT (media, "media was not prepared");
     return GST_CLOCK_TIME_NONE;
   }
@@ -4136,8 +4199,9 @@ gst_rtsp_media_get_time_provider (GstRTSPMedia * media, const gchar * address,
   g_return_val_if_fail (GST_IS_RTSP_MEDIA (media), NULL);
 
   priv = media->priv;
-
+  GST_DEBUG_OBJECT(media, "try lock state_lock");
   g_rec_mutex_lock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
   if (priv->time_provider) {
     if ((provider = priv->nettime) == NULL) {
       GstClock *clock;
@@ -4151,7 +4215,8 @@ gst_rtsp_media_get_time_provider (GstRTSPMedia * media, const gchar * address,
     }
   }
   g_rec_mutex_unlock (&priv->state_lock);
-
+  GST_DEBUG_OBJECT(media, "unlock state_lock");
+  GST_DEBUG_OBJECT(media, "Done.");
   if (provider)
     gst_object_ref (provider);
 
@@ -4199,6 +4264,7 @@ gst_rtsp_media_setup_sdp (GstRTSPMedia * media, GstSDPMessage * sdp,
   res = klass->setup_sdp (media, sdp, info);
 
   g_rec_mutex_unlock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "unlock state_lock");
   GST_DEBUG("Done.");
   return res;
 
@@ -4206,6 +4272,7 @@ gst_rtsp_media_setup_sdp (GstRTSPMedia * media, GstSDPMessage * sdp,
 no_setup_sdp:
   {
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     GST_ERROR ("no setup_sdp function");
     g_critical ("no setup_sdp vmethod function set");
     return FALSE;
@@ -4325,8 +4392,9 @@ gst_rtsp_media_handle_sdp (GstRTSPMedia * media, GstSDPMessage * sdp)
   g_return_val_if_fail (sdp != NULL, FALSE);
 
   priv = media->priv;
-
+  GST_DEBUG_OBJECT(media, "try lock state_lock");
   g_rec_mutex_lock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
 
   klass = GST_RTSP_MEDIA_GET_CLASS (media);
 
@@ -4336,13 +4404,15 @@ gst_rtsp_media_handle_sdp (GstRTSPMedia * media, GstSDPMessage * sdp)
   res = klass->handle_sdp (media, sdp);
 
   g_rec_mutex_unlock (&priv->state_lock);
-
+  GST_DEBUG_OBJECT(media, "unlock state_lock");
+  GST_DEBUG_OBJECT(media, "Done");
   return res;
 
   /* ERRORS */
 no_handle_sdp:
   {
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     GST_ERROR ("no handle_sdp function");
     g_critical ("no handle_sdp vmethod function set");
     return FALSE;
@@ -4433,7 +4503,9 @@ gst_rtsp_media_suspend (GstRTSPMedia * media)
     goto prepared_by_other_client;
   }
 
+  GST_DEBUG_OBJECT(media, "try lock state_lock");
   g_rec_mutex_lock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
   if (priv->status != GST_RTSP_MEDIA_STATUS_PREPARED)
     goto not_prepared;
 
@@ -4450,6 +4522,7 @@ gst_rtsp_media_suspend (GstRTSPMedia * media)
   gst_rtsp_media_set_status (media, GST_RTSP_MEDIA_STATUS_SUSPENDED);
 done:
   g_rec_mutex_unlock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "unlock state_lock");
 
   return TRUE;
 
@@ -4462,12 +4535,14 @@ prepared_by_other_client:
 not_prepared:
   {
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     GST_WARNING ("media %p was not prepared", media);
     return FALSE;
   }
 suspend_failed:
   {
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     gst_rtsp_media_set_status (media, GST_RTSP_MEDIA_STATUS_ERROR);
     GST_WARNING ("failed to suspend media %p", media);
     return FALSE;
@@ -4496,11 +4571,16 @@ default_unsuspend (GstRTSPMedia * media)
         gst_rtsp_media_set_status (media, GST_RTSP_MEDIA_STATUS_PREPARED);
       }
       g_rec_mutex_unlock (&priv->state_lock);
+      GST_DEBUG_OBJECT(media, "unlock state_lock");
       if (gst_rtsp_media_get_status (media) == GST_RTSP_MEDIA_STATUS_ERROR) {
-        g_rec_mutex_lock (&priv->state_lock);
+        GST_DEBUG_OBJECT(media, "try lock state_lock");
+  g_rec_mutex_lock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
         goto preroll_failed;
       }
-      g_rec_mutex_lock (&priv->state_lock);
+      GST_DEBUG_OBJECT(media, "try lock state_lock");
+  g_rec_mutex_lock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
       break;
     case GST_RTSP_SUSPEND_MODE_PAUSE:
       gst_rtsp_media_set_status (media, GST_RTSP_MEDIA_STATUS_PREPARED);
@@ -4516,8 +4596,11 @@ default_unsuspend (GstRTSPMedia * media)
         goto start_failed;
 
       g_rec_mutex_unlock (&priv->state_lock);
+      GST_DEBUG_OBJECT(media, "unlock state_lock");
       preroll_ok = wait_preroll (media);
-      g_rec_mutex_lock (&priv->state_lock);
+      GST_DEBUG_OBJECT(media, "try lock state_lock");
+  g_rec_mutex_lock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
 
       if (!preroll_ok)
         goto preroll_failed;
@@ -4558,7 +4641,9 @@ gst_rtsp_media_unsuspend (GstRTSPMedia * media)
 
   g_return_val_if_fail (GST_IS_RTSP_MEDIA (media), FALSE);
 
+  GST_DEBUG_OBJECT(media, "try lock state_lock");
   g_rec_mutex_lock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
   if (priv->status != GST_RTSP_MEDIA_STATUS_SUSPENDED)
     goto done;
 
@@ -4570,6 +4655,8 @@ gst_rtsp_media_unsuspend (GstRTSPMedia * media)
 
 done:
   g_rec_mutex_unlock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "unlock state_lock");
+  GST_DEBUG_OBJECT(media, "unlock state_lock");
 
   return TRUE;
 
@@ -4577,6 +4664,8 @@ done:
 unsuspend_failed:
   {
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     GST_WARNING ("failed to unsuspend media %p", media);
     gst_rtsp_media_set_status (media, GST_RTSP_MEDIA_STATUS_ERROR);
     return FALSE;
@@ -4629,10 +4718,12 @@ void
 gst_rtsp_media_set_pipeline_state (GstRTSPMedia * media, GstState state)
 {
   g_return_if_fail (GST_IS_RTSP_MEDIA (media));
-
+  GST_DEBUG_OBJECT(media, "try lock state_lock");
   g_rec_mutex_lock (&media->priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
   media_set_pipeline_state_locked (media, state);
   g_rec_mutex_unlock (&media->priv->state_lock);
+  GST_DEBUG_OBJECT(media, "Done");
 }
 
 /**
@@ -4661,14 +4752,18 @@ gst_rtsp_media_set_state (GstRTSPMedia * media, GstState state,
   g_return_val_if_fail (transports != NULL, FALSE);
 
   priv = media->priv;
-
+  GST_DEBUG_OBJECT(media, "try lock state_lock");
   g_rec_mutex_lock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "locked state_lock");
 
   if (priv->status == GST_RTSP_MEDIA_STATUS_PREPARING
       && gst_rtsp_media_is_shared (media)) {
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     gst_rtsp_media_get_status (media);
+    GST_DEBUG_OBJECT(media, "try lock state_lock");
     g_rec_mutex_lock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "locked state_lock");
   }
   if (priv->status == GST_RTSP_MEDIA_STATUS_ERROR)
     goto error_status;
@@ -4755,6 +4850,7 @@ gst_rtsp_media_set_state (GstRTSPMedia * media, GstState state,
     g_mutex_unlock (&priv->lock);
   }
   g_rec_mutex_unlock (&priv->state_lock);
+  GST_DEBUG_OBJECT(media, "unlock state_lock");
 
   return TRUE;
 
@@ -4763,6 +4859,7 @@ not_prepared:
   {
     GST_WARNING ("media %p was not prepared", media);
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     return FALSE;
   }
 error_status:
@@ -4783,6 +4880,7 @@ error_status:
       priv->n_active = 0;
     }
     g_rec_mutex_unlock (&priv->state_lock);
+    GST_DEBUG_OBJECT(media, "unlock state_lock");
     return FALSE;
   }
 }
