@@ -3189,7 +3189,7 @@ default_handle_message (GstRTSPMedia * media, GstMessage * message)
     case GST_MESSAGE_ELEMENT:
     {
       const GstStructure *s;
-
+      GST_DEBUG_OBJECT (media, "got GST_MESSAGE_ELEMENT");
       s = gst_message_get_structure (message);
       if (gst_structure_has_name (s, "GstRTSPStreamBlocking")) {
         GST_DEBUG ("media received blocking message");
